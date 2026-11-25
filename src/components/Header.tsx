@@ -24,7 +24,7 @@ export function Header({ asLink = false }: HeaderProps) {
   if (asLink) {
     return (
       <Link
-        href="/"
+        href="/videos"
         className="flex items-center hover:opacity-80 transition-opacity"
       >
         {content}

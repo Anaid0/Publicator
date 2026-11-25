@@ -1,0 +1,3 @@
+[submodule "ClaudeAnimationBase"]
+	path = ClaudeAnimationBase
+	url = https://github.com/JohnHeibel/ClaudeAnimationBase.git

@@ -84,7 +84,7 @@ function DemoPageContent() {
         <div className="flex flex-col gap-2">
           <Header asLink />
           <Link
-            href="/"
+            href="/videos"
             className="flex items-center gap-1.5 text-xs text-muted-foreground-dim hover:text-foreground transition-colors"
           >
             <ArrowLeft className="w-3 h-3" />

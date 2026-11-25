@@ -1,0 +1,472 @@
+openapi: 3.0.3
+info:
+  title: Publicador multired
+  version: 1.0.0
+  description: |
+    API local del publicador. Recibe una pieza (imagen o video + copy), la programa
+    para el día en curso y Claude in Chrome la publica en TikTok, X, LinkedIn y
+    WhatsApp (estado, canal y grupos) con el perfil de Chrome configurado por producto.
+
+    - Todas las horas son del día en curso, en la hora local del Mac (America/Bogota).
+    - TikTok, X y LinkedIn se programan **dentro de la plataforma** (modo `nativo`) si
+      faltan 20 minutos o más; si no, se publican a la hora (modo `a_la_hora`).
+      WhatsApp siempre va en modo `a_la_hora`.
+    - El scheduler ejecuta una tarea a la vez. Los errores devuelven `{ "error": "mensaje" }`.
+    - Sin autenticación: pensada para uso local en `localhost`.
+servers:
+  - url: http://localhost:3000
+    description: Servidor local
+tags:
+  - name: Publicaciones
+    description: Crear y seguir publicaciones (jobs) y sus tareas por red
+  - name: Copy
+    description: Adaptación del copy a cada red con Claude
+  - name: Ajustes
+    description: Perfiles de Chrome, cuentas por producto y WhatsApp
+
+paths:
+  /api/publicar:
+    get:
+      tags: [Publicaciones]
+      summary: Publicaciones de hoy
+      description: Devuelve las publicaciones de hoy y las de días anteriores que aún tienen tareas abiertas (`en_espera`, `en_cola` o `ejecutando`).
+      operationId: listJobs
+      responses:
+        "200":
+          description: Lista de publicaciones
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [jobs]
+                properties:
+                  jobs:
+                    type: array
+                    items: { $ref: "#/components/schemas/PublishJob" }
+    post:
+      tags: [Publicaciones]
+      summary: Crear una publicación
+      description: |
+        Guarda el archivo en `content/{Producto}/{fecha}/` y crea una tarea por cada red.
+        Las tareas que ya pueden ejecutarse arrancan de inmediato.
+      operationId: createJob
+      requestBody:
+        required: true
+        content:
+          multipart/form-data:
+            schema:
+              type: object
+              required: [product, file, time, platforms]
+              properties:
+                product: { $ref: "#/components/schemas/ProductId" }
+                file:
+                  type: string
+                  format: binary
+                  description: Imagen (png, jpg, webp, gif) o video (mp4, mov, webm, m4v). Máximo 10 MB para que Chrome pueda subirlo.
+                time:
+                  type: string
+                  pattern: "^\\d{2}:\\d{2}$"
+                  example: "18:30"
+                  description: Hora local HH:mm de hoy.
+                copy:
+                  type: string
+                  description: Copy original. El agente lo ajusta a cada red si no hay copy aprobado para ella.
+                platforms:
+                  type: array
+                  minItems: 1
+                  items: { $ref: "#/components/schemas/PlatformId" }
+                  description: Repite el campo por cada red (`platforms=x&platforms=linkedin`).
+                copies:
+                  type: string
+                  description: JSON con el copy aprobado por red (`{"x":"…","linkedin":"…"}`). Ese texto se publica tal cual. Se ignoran las redes no seleccionadas.
+                  example: '{"x":"Verifica antes de contratar. verificaya.co","linkedin":"Texto largo para LinkedIn…"}'
+            encoding:
+              platforms:
+                style: form
+                explode: true
+      responses:
+        "200":
+          description: Publicación creada
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [job]
+                properties:
+                  job: { $ref: "#/components/schemas/PublishJob" }
+        "400": { $ref: "#/components/responses/BadRequest" }
+
+  /api/publicar/{id}:
+    parameters:
+      - $ref: "#/components/parameters/JobId"
+    get:
+      tags: [Publicaciones]
+      summary: Detalle de una publicación
+      description: Incluye el estado, el log del agente y la URL resultante de cada red.
+      operationId: getJob
+      responses:
+        "200":
+          description: Publicación
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [job]
+                properties:
+                  job: { $ref: "#/components/schemas/PublishJob" }
+        "404": { $ref: "#/components/responses/NotFound" }
+    post:
+      tags: [Publicaciones]
+      summary: Reintentar o cancelar la tarea de una red
+      description: |
+        - `retry`: vuelve a planear la tarea (no se permite si está `ejecutando`).
+        - `cancel`: solo para tareas que no han empezado (`en_espera` o `en_cola`).
+      operationId: taskAction
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [action, platform]
+              properties:
+                action:
+                  type: string
+                  enum: [retry, cancel]
+                platform: { $ref: "#/components/schemas/PlatformId" }
+            example: { action: cancel, platform: x }
+      responses:
+        "200":
+          description: Publicación actualizada
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [job]
+                properties:
+                  job: { $ref: "#/components/schemas/PublishJob" }
+        "400": { $ref: "#/components/responses/BadRequest" }
+
+  /api/publicar/{id}/media:
+    parameters:
+      - $ref: "#/components/parameters/JobId"
+    get:
+      tags: [Publicaciones]
+      summary: Archivo de la publicación
+      operationId: getJobMedia
+      responses:
+        "200":
+          description: La imagen o el video tal como se guardó
+          content:
+            image/*:
+              schema: { type: string, format: binary }
+            video/*:
+              schema: { type: string, format: binary }
+        "404":
+          description: Publicación o archivo no encontrado
+          content:
+            text/plain:
+              schema: { type: string, example: No encontrado }
+
+  /api/publicar/adaptar:
+    post:
+      tags: [Copy]
+      summary: Adaptar el copy a cada red
+      description: Claude reescribe el copy original según el tono y el límite de cada red (X 280, TikTok 2200, LinkedIn 3000, estado 700, canal y grupos 4000). Tarda entre 20 y 60 segundos.
+      operationId: adaptCopy
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [product, copy, platforms]
+              properties:
+                product: { $ref: "#/components/schemas/ProductId" }
+                copy: { type: string }
+                platforms:
+                  type: array
+                  minItems: 1
+                  items: { $ref: "#/components/schemas/PlatformId" }
+            example:
+              product: verificaya
+              copy: "¿Vas a contratar a alguien? Verifica sus antecedentes en minutos con VerificaYA. #seguridad"
+              platforms: [x, linkedin, wa_canal]
+      responses:
+        "200":
+          description: Copy por red
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [copies]
+                properties:
+                  copies: { $ref: "#/components/schemas/CopiesByPlatform" }
+                  costUsd:
+                    type: number
+                    description: Costo aproximado de la llamada a Claude.
+        "400": { $ref: "#/components/responses/BadRequest" }
+
+  /api/publicar/config:
+    get:
+      tags: [Ajustes]
+      summary: Leer ajustes
+      operationId: getConfig
+      responses:
+        "200":
+          description: Ajustes actuales (`data/publicador.json`)
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [config]
+                properties:
+                  config: { $ref: "#/components/schemas/PublisherConfig" }
+    put:
+      tags: [Ajustes]
+      summary: Guardar ajustes
+      description: Acepta `{ config }` o el objeto de ajustes directamente. Lo que falte se completa con valores por defecto.
+      operationId: putConfig
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                config: { $ref: "#/components/schemas/PublisherConfig" }
+      responses:
+        "200":
+          description: Ajustes guardados
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [config]
+                properties:
+                  config: { $ref: "#/components/schemas/PublisherConfig" }
+        "400": { $ref: "#/components/responses/BadRequest" }
+
+  /api/publicar/browsers:
+    post:
+      tags: [Ajustes]
+      summary: Detectar navegadores conectados
+      description: Lista los perfiles de Chrome con la extensión Claude in Chrome conectada. Usa Claude (Haiku) y tarda unos segundos.
+      operationId: detectBrowsers
+      responses:
+        "200":
+          description: Navegadores conectados
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [browsers]
+                properties:
+                  browsers:
+                    type: array
+                    items:
+                      type: object
+                      required: [deviceId, name]
+                      properties:
+                        deviceId: { type: string, format: uuid }
+                        name: { type: string, example: Browser 1 }
+        "500":
+          description: No se pudo detectar
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+
+components:
+  parameters:
+    JobId:
+      name: id
+      in: path
+      required: true
+      description: Id de la publicación (`YYYY-MM-DD-xxxxxxxx`).
+      schema: { type: string, example: 2026-11-25-9b8e314a }
+
+  responses:
+    BadRequest:
+      description: Datos inválidos o acción no permitida
+      content:
+        application/json:
+          schema: { $ref: "#/components/schemas/Error" }
+    NotFound:
+      description: No encontrada
+      content:
+        application/json:
+          schema: { $ref: "#/components/schemas/Error" }
+
+  schemas:
+    Error:
+      type: object
+      required: [error]
+      properties:
+        error: { type: string, example: Plataforma inválida }
+
+    ProductId:
+      type: string
+      enum: [verificaya, trayectoya, monkeyjobs, nygsoft]
+
+    PlatformId:
+      type: string
+      enum: [tiktok, x, linkedin, wa_estado, wa_canal, wa_grupos]
+
+    TaskStatus:
+      type: string
+      enum: [en_espera, en_cola, ejecutando, programado, publicado, requiere_accion, fallido, cancelado]
+      description: |
+        - `en_espera`: esperando su hora.
+        - `en_cola`: lista para ejecutarse.
+        - `ejecutando`: el agente está trabajando en Chrome.
+        - `programado`: quedó programada dentro de la plataforma.
+        - `publicado`: ya salió.
+        - `requiere_accion`: sesión cerrada, 2FA, CAPTCHA o perfil sin navegador; necesita a una persona.
+        - `fallido`, `cancelado`.
+
+    TaskMode:
+      type: string
+      enum: [nativo, a_la_hora]
+
+    CopiesByPlatform:
+      type: object
+      description: Copy por red. Las claves son ids de plataforma.
+      properties:
+        tiktok: { type: string, maxLength: 2200 }
+        x: { type: string, description: "Máximo 280; cada enlace cuenta 23." }
+        linkedin: { type: string, maxLength: 3000 }
+        wa_estado: { type: string, maxLength: 700 }
+        wa_canal: { type: string, maxLength: 4000 }
+        wa_grupos: { type: string, maxLength: 4000 }
+      additionalProperties: false
+
+    LogEntry:
+      type: object
+      required: [at, text]
+      properties:
+        at: { type: string, format: date-time }
+        text: { type: string }
+
+    PublishTask:
+      type: object
+      required: [platform, status, mode, runAt, log]
+      properties:
+        platform: { $ref: "#/components/schemas/PlatformId" }
+        status: { $ref: "#/components/schemas/TaskStatus" }
+        mode: { $ref: "#/components/schemas/TaskMode" }
+        runAt:
+          type: string
+          format: date-time
+          description: Cuándo arranca el agente.
+        startedAt: { type: string, format: date-time }
+        finishedAt: { type: string, format: date-time }
+        detail:
+          type: string
+          description: Resumen del agente o motivo del fallo.
+        url:
+          type: string
+          description: Enlace a la publicación, si la red lo da.
+        costUsd: { type: number }
+        log:
+          type: array
+          items: { $ref: "#/components/schemas/LogEntry" }
+
+    PublishJob:
+      type: object
+      required: [id, product, mediaPath, mediaName, mediaType, mediaBytes, copy, date, time, publishAt, createdAt, tasks]
+      properties:
+        id: { type: string, example: 2026-11-25-9b8e314a }
+        product: { $ref: "#/components/schemas/ProductId" }
+        mediaPath:
+          type: string
+          description: Ruta absoluta del archivo en el Mac.
+        mediaName: { type: string }
+        mediaType:
+          type: string
+          enum: [image, video]
+        mediaBytes: { type: integer }
+        copy: { type: string }
+        copies: { $ref: "#/components/schemas/CopiesByPlatform" }
+        date:
+          type: string
+          format: date
+          description: Fecha local (siempre hoy).
+        time:
+          type: string
+          example: "18:30"
+        publishAt: { type: string, format: date-time }
+        createdAt: { type: string, format: date-time }
+        tasks:
+          type: array
+          items: { $ref: "#/components/schemas/PublishTask" }
+
+    ChromeProfile:
+      type: object
+      required: [id, label, deviceId]
+      properties:
+        id: { type: string, example: principal }
+        label: { type: string, example: Publicator }
+        deviceId:
+          type: string
+          description: deviceId de la extensión Claude in Chrome. Vacío si no tiene navegador asignado.
+
+    AccountConfig:
+      type: object
+      required: [enabled, profileId, account, notes]
+      properties:
+        enabled: { type: boolean }
+        profileId: { type: string }
+        account:
+          type: string
+          description: Cuenta, página o número que debe estar abierto.
+          example: "@VerficaYa"
+        notes:
+          type: string
+          description: Instrucciones extra para el agente.
+
+    WhatsAppConfig:
+      type: object
+      required: [channel, channelUrl, groups]
+      properties:
+        channel: { type: string }
+        channelUrl:
+          type: string
+          example: https://whatsapp.com/channel/0029VbEGYyh9sBI2s2ohOh2w
+        groups:
+          type: array
+          items: { type: string }
+
+    AccountsByPlatform:
+      type: object
+      properties:
+        tiktok: { $ref: "#/components/schemas/AccountConfig" }
+        x: { $ref: "#/components/schemas/AccountConfig" }
+        linkedin: { $ref: "#/components/schemas/AccountConfig" }
+        wa_estado: { $ref: "#/components/schemas/AccountConfig" }
+        wa_canal: { $ref: "#/components/schemas/AccountConfig" }
+        wa_grupos: { $ref: "#/components/schemas/AccountConfig" }
+
+    PublisherConfig:
+      type: object
+      required: [model, profiles, accounts, whatsapp]
+      properties:
+        model:
+          type: string
+          enum: [sonnet, opus, haiku]
+        profiles:
+          type: array
+          items: { $ref: "#/components/schemas/ChromeProfile" }
+        accounts:
+          type: object
+          properties:
+            verificaya: { $ref: "#/components/schemas/AccountsByPlatform" }
+            trayectoya: { $ref: "#/components/schemas/AccountsByPlatform" }
+            monkeyjobs: { $ref: "#/components/schemas/AccountsByPlatform" }
+            nygsoft: { $ref: "#/components/schemas/AccountsByPlatform" }
+        whatsapp:
+          type: object
+          properties:
+            verificaya: { $ref: "#/components/schemas/WhatsAppConfig" }
+            trayectoya: { $ref: "#/components/schemas/WhatsAppConfig" }
+            monkeyjobs: { $ref: "#/components/schemas/WhatsAppConfig" }
+            nygsoft: { $ref: "#/components/schemas/WhatsAppConfig" }
